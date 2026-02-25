@@ -17,6 +17,16 @@ class CarListing(BaseModel):
     car_vin: Optional[str] = None
     datetime_found: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
+    @field_validator("title", "username", "image_url", mode="before")
+    @classmethod
+    def require_non_empty_str(cls, value, info):
+        if value is None:
+            raise ValueError(f"{info.field_name} is required")
+        string = str(value).strip()
+        if not string:
+            raise ValueError(f"{info.field_name} is required")
+        return string
+
     @field_validator("price_usd", mode="before")
     @classmethod
     def parse_price(cls, value):
@@ -48,6 +58,13 @@ class CarListing(BaseModel):
         if value is None:
             return None
         if isinstance(value, int):
-            return value
-        s = re.sub(r"\D", "", str(value))
-        return int(s) if s else None
+            string = str(value)
+        else:
+            string = re.sub(r"\D", "", str(value))
+        if not string:
+            return None
+        if string.startswith("0") and len(string) == 10:
+            string = "380" + string[1:]
+        elif len(string) == 9:
+            string = "380" + string
+        return int(string)
