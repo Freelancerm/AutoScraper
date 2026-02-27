@@ -316,35 +316,41 @@ class Scraper:
                 existing = db.existing_urls(all_urls)
                 new_urls = [url for url in all_urls if url not in existing]
                 logging.info(f"Found {len(all_urls)} links, {len(existing)} already in DB, {len(new_urls)} new to process.")
-                if not all_urls:
+                if not new_urls:
                     continue
 
-                tasks = [self._process_single_listing(session, url, db) for url in new_urls]
-                await asyncio.gather(*tasks)
+                tasks = [self._process_single_listing(session, url) for url in new_urls]
+                results = await asyncio.gather(*tasks)
+
+                batch = [r for r in results if r is not None]
+                if batch:
+                    db.insert_batch(batch)
+                    logging.info("Saved %s listings from page %s", len(batch), page_num)
 
                 # For stability
                 # await asyncio.sleep(1.5)
 
     async def _process_single_listing(
-            self, session: aiohttp.ClientSession, url: str, db
-    ) -> None:
-        """Helper method to process a single listing URL: fetch, parse, and save to DB."""
+            self, session: aiohttp.ClientSession, url: str
+    ) -> CarListing | None:
         try:
             html = await self.fetch_listing_html(session, url)
             if not html:
-                return
+                return None
+
             if "Оголошення не знайдено" in html or "Видалено" in html:
                 logging.info("Skip %s: listing removed", url)
-                return
-            car_data = await self.parse_listing_page(session, html, url)
-            if not car_data.image_url:
-                logging.info("Skip %s: no image_url (deleted/invalid listing)", url)
-            if not car_data.phone_number:
-                logging.info("Skip %s : no phone number (API error or missing IDs)", url)
+                return None
 
-            # Saved to DB after parsing each listing to avoid data loss in case of crashes.
-            db.insert_batch([car_data])
-            logging.info("Saved: %s | %s", car_data.title, car_data.phone_number)
+            car_data = await self.parse_listing_page(session, html, url)
+
+            if not car_data.image_url:
+                logging.info("Listing %s: missing image_url", url)
+            if not car_data.phone_number:
+                logging.info("Listing %s: missing phone_number", url)
+
+            return car_data
 
         except Exception as ex:
-            logging.exception(f"Error in process %s, {ex}", url)
+            logging.exception(f"Error processing %s {ex}", url)
+            return None

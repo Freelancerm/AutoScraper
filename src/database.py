@@ -19,7 +19,7 @@ CREATE_TABLE = """
         odometer INTEGER,
         username TEXT NOT NULL,
         phone_number BIGINT,
-        image_url TEXT NOT NULL,
+        image_url TEXT,
         images_count INTEGER NOT NULL,
         car_number TEXT,
         car_vin TEXT,
@@ -59,9 +59,9 @@ class DB:
         """ Check which of the given URLs already exist in the database. """
         if not urls:
             return set()
-        q = "SELECT url FROM car_listings WHERE url = ANY(%s)"
+        query = "SELECT url FROM car_listings WHERE url = ANY(%s)"
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(q, (urls,))
+            cur.execute(query, (urls,))
             return {row[0] for row in cur.fetchall()}
 
     def insert_batch(self, listings: Iterable[CarListing]) -> None:
