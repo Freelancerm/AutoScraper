@@ -1,4 +1,3 @@
-import json
 import asyncio
 import math
 import re
@@ -9,7 +8,8 @@ from bs4 import BeautifulSoup
 
 from .config import (
     SCRAPE_START_URL,
-    MAX_CONCURRENT_RETRIES,
+    MAX_RETRIES,
+    MAX_CONCURRENCY,
     MAX_PAGES_TO_SCRAPE
 )
 from typing import List, Optional
@@ -20,56 +20,13 @@ AD_PER_PAGE = 20
 
 class Scraper:
     """Main Scraper class to handle fetching and parsing of auto listings from auto.ria.com."""
+
     def __init__(self):
         self.headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         self.timeout = aiohttp.ClientTimeout(total=20)
-        self.sem = asyncio.Semaphore(MAX_CONCURRENT_RETRIES)
-
-    # === HELPERS ===
-    @staticmethod
-    def _get_pinia(html: str) -> dict:
-        """ Extract Data from Pinia state from HTML. We look for the JavaScript variable window.__PINIA__ and try to parse the JSON object that follows it."""
-        start_marker = "window.__PINIA__ ="
-        start_index = html.find(start_marker)
-        if start_index == -1:
-            return {}
-
-        # Find the start of the JSON object after the marker
-        json_start = html.find("{", start_index)
-        if json_start == -1:
-            return {}
-
-        # Find the matching closing bracket for the JSON object. We need to account for nested brackets, so we will count them.
-        bracket_count = 0
-        json_str = ""
-        for i in range(json_start, len(html)):
-            char = html[i]
-            if char == "{":
-                bracket_count += 1
-            elif char == "}":
-                bracket_count -= 1
-
-            json_str += char
-
-            if bracket_count == 0:
-                break
-
-        if not json_str:
-            return {}
-
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            # If JSON parsing fails, we can try to clean the string from common issues like trailing commas or unescaped characters.
-            try:
-                # Minimal cleaning: remove trailing commas before closing brackets
-                clean_json = re.sub(r",\s*([\]}])", r"\1", json_str)
-                return json.loads(clean_json)
-            except:
-                logging.error(f"Pinia Hard Decode Error: {str(e)[:100]}")
-        return {}
+        self.sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
     # === TOTAL PAGES ===
     async def get_total_pages(self, session: aiohttp.ClientSession) -> int:
@@ -80,7 +37,6 @@ class Scraper:
         logging.info("Getting count pages from window.ria.server.resultsCount...")
 
         # Load the first page HTML to find the total results count.
-        # We use the stable _fetch method with retries.
         html = await self._fetch(session, SCRAPE_START_URL + "?page=1")
 
         if not html:
@@ -113,11 +69,11 @@ class Scraper:
         """Fetch a URL with retries and exponential backoff."""
         backoff = 1.0
 
-        for attempt in range(1, MAX_CONCURRENT_RETRIES + 1):
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with self.sem:
                     async with session.get(
-                        url, headers=self.headers, allow_redirects=True
+                            url, headers=self.headers, allow_redirects=True
                     ) as resp:
                         status = resp.status
                         raw = await resp.read()
@@ -139,7 +95,7 @@ class Scraper:
     # === SEARCH PAGE: fetch + parse urls ===
 
     async def fetch_search_page(
-        self, session: aiohttp.ClientSession, page_num: int
+            self, session: aiohttp.ClientSession, page_num: int
     ) -> str:
         """Fetch a search results page HTML."""
         url = f"{SCRAPE_START_URL}?page={page_num}"
@@ -162,20 +118,9 @@ class Scraper:
 
     # === LISTING PAGE: fetch + parse to CarListing ===
     async def fetch_listing_html(
-        self, session: aiohttp.ClientSession, url: str
+            self, session: aiohttp.ClientSession, url: str
     ) -> Optional[str]:
         return await self._fetch(session, url)
-
-    def _find_key_recursive(self, data: dict, target_key: str):
-        """ Finds key in nested dicts. Returns value if found, else None. """
-        if target_key in data:
-            return data[target_key]
-        for key, value in data.items():
-            if isinstance(value, dict):
-                result = self._find_key_recursive(value, target_key)
-                if result:
-                    return result
-        return None
 
     @staticmethod
     def _get_title(soup: BeautifulSoup) -> str:
@@ -184,15 +129,15 @@ class Scraper:
 
     @staticmethod
     def _get_price_usd(html: str, soup: BeautifulSoup) -> int | None:
-        # 1. Price in usd
+        """Extract price in USD from HTML using regex and BeautifulSoup as fallback."""
         price_usd = 0
-        # Find price in USD. It can be in different formats, so we will try several regex patterns to find it.
-        # We will look for "usd":12345 or "priceUSD":12345 or "price":12345 in the raw HTML, and if that fails, we will try to find it in the text using BeautifulSoup.
+
         price_match = (
                 re.search(r'"usd"\s*:\s*(\d+)', html)
                 or re.search(r'"priceUSD"\s*:\s*(\d+)', html)
                 or re.search(r'"price"\s*:\s*(\d+)', html)
         )
+
         if price_match:
             val = int(price_match.group(1))
             # If price is small (like 11), it's likely not price.
@@ -208,18 +153,18 @@ class Scraper:
 
     @staticmethod
     def _get_odometer(html: str) -> int | None:
-        """Extract odometer (mileage) from HTML using regex."""
+        """
+        Extract odometer (mileage) from HTML using regex.
+        Find raceInt of odometer. It can be in different formats, so we will try several regex patterns to find it.
+        We will look for "raceInt":12345 or "odometer":12345 in the raw HTML, and if that fails, we will try to find it in the text using BeautifulSoup.
+        """
         odometer = 0
-        # Find raceInt of odometer. It can be in different formats, so we will try several regex patterns to find it.
-        # We will look for "raceInt":12345 or "odometer":12345 in the raw HTML, and if that fails, we will try to find it in the text using BeautifulSoup.
+
         odo_match = re.search(r'"raceInt"\s*:\s*(\d+)', html) or re.search(
             r'"odometer"\s*:\s*(\d+)', html
         )
         if odo_match:
-            val = int(odo_match.group(1))
-            # If number is small (like 150), it's likely in thousands, so we will multiply it by 1000.
-            # If it's large (150000), it's already in full amount.
-            odometer = val * 1000 if val < 2000 else val
+            return int(odo_match.group(1))
         else:
             # Reserve search in text, like "150 тис. км"
             text_odo = re.search(r"(\d+)\s*тис\.\s*км", html)
@@ -228,62 +173,64 @@ class Scraper:
         return odometer if odometer > 0 else None
 
     @staticmethod
-    def _get_username(html:str) -> str:
+    def _get_username(html: str) -> str:
         """Extract seller's name from HTML."""
         username_match = re.search(r'"userName"\s*:\s*"([^"]+)"', html)
         return username_match.group(1) if username_match else "Продавець"
 
-
     async def _get_phone_number(
             self, session: aiohttp.ClientSession, html: str, url: str
-        ) -> int | None:
-            # Get userId, phoneId, autoId from HTML. It can be in PINIA or in the raw HTML as JavaScript variables. We will try both.
-            user_id_match = re.search(r'"userId"\s*:\s*(\d+)', html)
-            phone_id_match = re.search(r'"phoneId"\s*:\s*"(\d+)"', html)
-            auto_id_match = re.search(r"_(\d+)\.html", url)
+    ) -> int | None:
+        """
+        Get userId, phoneId, autoId from HTML.
+        It can be in PINIA or in the raw HTML as JavaScript variables.
+        """
+        user_id_match = re.search(r'"userId"\s*:\s*(\d+)', html)
+        phone_id_match = re.search(r'"phoneId"\s*:\s*"(\d+)"', html)
+        auto_id_match = re.search(r"_(\d+)\.html", url)
 
-            user_id = user_id_match.group(1) if user_id_match else None
-            phone_id = phone_id_match.group(1) if phone_id_match else None
-            auto_id = auto_id_match.group(1) if auto_id_match else None
+        user_id = user_id_match.group(1) if user_id_match else None
+        phone_id = phone_id_match.group(1) if phone_id_match else None
+        auto_id = auto_id_match.group(1) if auto_id_match else None
 
-            if not all([user_id, phone_id, auto_id]):
-                logging.warning(f"Still no IDs for {url}: user={user_id}, phone={phone_id}")
-                return None
-
-            # Proceed to API call to get phone number using the extracted IDs.
-            payload = {
-                "blockId": "autoPhone",
-                "popUpId": "autoPhone",
-                "autoId": int(auto_id),
-                "data": [
-                    ["userId", str(user_id)],
-                    ["phoneId", str(phone_id)],
-                    ["userName", "Продавець"],
-                    ["srcAnalytic", "main_side_sellerInfo_sellerInfoPhone_showBottomPopUp"],
-                ],
-                "params": {"userId": str(user_id), "phoneId": str(phone_id)},
-                "langId": 4,
-                "device": "desktop-web",
-            }
-
-            api_url = "https://auto.ria.com/bff/final-page/public/auto/popUp/"
-            headers = {
-                **self.headers,
-                "X-Ria-Source": "vue3-1.47.0",
-                "Content-Type": "application/json",
-            }
-
-            try:
-                async with session.post(api_url, json=payload, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        res = data.get("additionalParams", {}).get("phoneStr", "")
-                        raw_phone = re.sub(r"\D", "", res)
-                        if raw_phone.startswith("0") and len(raw_phone) == 10:
-                            return int("38" + raw_phone)
-            except Exception as ex:
-                logging.error(f"API Phone Error: {ex}")
+        if not all([user_id, phone_id, auto_id]):
+            logging.warning(f"Still no IDs for {url}: user={user_id}, phone={phone_id}")
             return None
+
+        # Proceed to API call to get phone number using the extracted IDs.
+        payload = {
+            "blockId": "autoPhone",
+            "popUpId": "autoPhone",
+            "autoId": int(auto_id),
+            "data": [
+                ["userId", str(user_id)],
+                ["phoneId", str(phone_id)],
+                ["userName", "Продавець"],
+                ["srcAnalytic", "main_side_sellerInfo_sellerInfoPhone_showBottomPopUp"],
+            ],
+            "params": {"userId": str(user_id), "phoneId": str(phone_id)},
+            "langId": 4,
+            "device": "desktop-web",
+        }
+
+        api_url = "https://auto.ria.com/bff/final-page/public/auto/popUp/"
+        headers = {
+            **self.headers,
+            "X-Ria-Source": "vue3-1.47.0",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with session.post(api_url, json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    res = data.get("additionalParams", {}).get("phoneStr", "")
+                    raw_phone = re.sub(r"\D", "", res)
+                    if raw_phone.startswith("0") and len(raw_phone) == 10:
+                        return int("38" + raw_phone)
+        except Exception as ex:
+            logging.error(f"API Phone Error: {ex}")
+        return None
 
     @staticmethod
     def _get_images(html: str) -> tuple:
@@ -295,7 +242,7 @@ class Scraper:
         return (image_links[0], len(image_links)) if image_links else (None, 0)
 
     @staticmethod
-    def _get_car_number(html: str, soup: BeautifulSoup) -> str | None:
+    def _get_car_number(html: str) -> str | None:
         """
         Extract car number (stateNumber) from HTML.
         We will try several methods to find it, starting with the most reliable one (meta description), and then falling back to BeautifulSoup if needed.
@@ -306,15 +253,6 @@ class Scraper:
 
         if number_match:
             return number_match.group(1).strip()
-
-        # Second try: find the span with class "state-num" and extract text.
-        # It may contain the number along with region and city, so we will clean it to get only the number part.
-        num_tag = soup.find("span", class_="state-num")
-        if num_tag:
-            raw_text = num_tag.get_text(strip=True)
-            clean_number = raw_text.split(" ")[0].replace(" ", "")
-            return clean_number
-
         return None
 
     @staticmethod
@@ -324,7 +262,7 @@ class Scraper:
         return vin_match.group(1) if vin_match else None
 
     async def parse_listing_page(
-        self, session: aiohttp.ClientSession, html: str, url: str
+            self, session: aiohttp.ClientSession, html: str, url: str
     ) -> CarListing:
         soup = BeautifulSoup(html, "html.parser")
 
@@ -334,7 +272,7 @@ class Scraper:
         username = self._get_username(html)
         phone_number = await self._get_phone_number(session, html, url)
         image_url, images_count = self._get_images(html)
-        car_number = self._get_car_number(html, soup)
+        car_number = self._get_car_number(html)
         car_vin = self._get_car_vin(html)
 
         return CarListing(
@@ -392,10 +330,10 @@ class Scraper:
                 await asyncio.gather(*tasks)
 
                 # For stability
-                await asyncio.sleep(1.5)
+                # await asyncio.sleep(1.5)
 
     async def _process_single_listing(
-        self, session: aiohttp.ClientSession, url: str, db
+            self, session: aiohttp.ClientSession, url: str, db
     ) -> None:
         """Helper method to process a single listing URL: fetch, parse, and save to DB."""
         try:
@@ -406,10 +344,8 @@ class Scraper:
             car_data = await self.parse_listing_page(session, html, url)
 
             # Saved to DB after parsing each listing to avoid data loss in case of crashes.
-            # The is_sampled check before ensures we don't save duplicates.
-            db.save_listing(car_data)
+            db.insert_batch(car_data)
             logging.info(f"Saved: {car_data.title} | {car_data.phone_number}")
 
         except Exception as ex:
             logging.error(f"Error in process {url}: {ex}")
-

@@ -3,7 +3,7 @@ import subprocess
 import logging
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Iterable, Mapping, Any
+from typing import Iterable
 
 import psycopg
 
@@ -66,11 +66,7 @@ class DB:
             logging.error(f"Database check error: {ex}")
             return False
 
-    def save_listing(self, car: CarListing) -> None:
-        """Save a single CarListing to the database."""
-        self.insert_batch([car])
-
-    def insert_batch(self, listings: Iterable[CarListing | Mapping[str, Any]]) -> None:
+    def insert_batch(self, listings: Iterable[CarListing]) -> None:
         """ Insert a batch of listings into the database. Accepts both CarListing instances and dicts."""
         params = []
         for listing in listings:

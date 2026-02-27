@@ -7,5 +7,6 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_NAME = os.getenv("DB_NAME")
 
 SCRAPE_START_URL = os.getenv("SCRAPE_START_URL", "https://auto.ria.com/uk/car/used/")
-MAX_CONCURRENT_RETRIES = int(os.getenv("MAX_CONCURRENT_RETRIES", "3"))
-MAX_PAGES_TO_SCRAPE = 2
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "5"))
+MAX_PAGES_TO_SCRAPE = 0

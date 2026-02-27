@@ -9,7 +9,7 @@ class CarListing(BaseModel):
     odometer: int | None
     username: str
     phone_number: int
-    image_url: str
+    image_url: str | None
     images_count: int
     car_number: str | None
     car_vin: str | None
