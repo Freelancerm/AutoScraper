@@ -1,5 +1,6 @@
 import os
 import subprocess
+import logging
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Iterable, Mapping, Any
@@ -10,8 +11,7 @@ from .config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
 from .models import CarListing
 
 
-class DB:
-    CREATE_TABLE = """
+CREATE_TABLE = """
         CREATE TABLE IF NOT EXISTS car_listings (
         url TEXT NOT NULL UNIQUE,
         title TEXT NOT NULL,
@@ -26,7 +26,7 @@ class DB:
         datetime_found TIMESTAMPTZ NOT NULL
         );
         """
-    LISTING_INSERT = """
+LISTING_INSERT = """
           INSERT INTO car_listings
             (url, title, price_usd, odometer, username, phone_number,
              image_url, images_count, car_number, car_vin, datetime_found)
@@ -35,6 +35,9 @@ class DB:
              %(image_url)s, %(images_count)s, %(car_number)s, %(car_vin)s, %(datetime_found)s)
           ON CONFLICT (url) DO NOTHING;
           """
+
+
+class DB:
     DUMPS_DIR = Path("dumps")
 
     @staticmethod
@@ -49,10 +52,26 @@ class DB:
 
     def init_db(self) -> None:
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(self.CREATE_TABLE)
+            cur.execute(CREATE_TABLE)
             conn.commit()
 
+    def is_sampled(self, url: str) -> bool:
+        """Check if a listing with the given URL already exists in the database."""
+        query = "SELECT 1 FROM car_listings WHERE url = %s LIMIT 1"
+        try:
+            with self._connect() as conn, conn.cursor() as cur:
+                cur.execute(query, (url,))
+                return cur.fetchone() is not None
+        except Exception as ex:
+            logging.error(f"Database check error: {ex}")
+            return False
+
+    def save_listing(self, car: CarListing) -> None:
+        """Save a single CarListing to the database."""
+        self.insert_batch([car])
+
     def insert_batch(self, listings: Iterable[CarListing | Mapping[str, Any]]) -> None:
+        """ Insert a batch of listings into the database. Accepts both CarListing instances and dicts."""
         params = []
         for listing in listings:
             if hasattr(listing, "model_dump"):
@@ -62,12 +81,13 @@ class DB:
         if not params:
             return
         with self._connect() as conn, conn.cursor() as cur:
-            cur.executemany(self.LISTING_INSERT, params)
+            cur.executemany(LISTING_INSERT, params)
             conn.commit()
 
     def create_dump(self) -> None:
-        self.DUMPS_DIR.mkdir(parents=True, exist_ok=True)
-        output_path = self.DUMPS_DIR / f"dump_{datetime.now(UTC):%Y%m%d_%H%M%S}.dump"
+        filename = f"dump_{datetime.now(UTC):%Y%m%d_%H%M%S}.dump"
+        output_path = self.DUMPS_DIR / filename
+        logging.info(f"📦 Creating backup to DB: {filename}")
         cmd = [
             "pg_dump",
             "--format=custom",
@@ -86,6 +106,3 @@ class DB:
             env["PGPASSWORD"] = DB_PASSWORD
         subprocess.run(cmd, check=True, env=env)
 
-    def process_batch(self, listings: Iterable[CarListing | Mapping[str, Any]]) -> None:
-        self.insert_batch(listings)
-        self.create_dump()

@@ -1,304 +1,415 @@
-import asyncio
 import json
-import logging
-import random
+import asyncio
+import math
 import re
-from typing import Any, AsyncIterator
-from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qs
+import logging
 
 import aiohttp
-from pydantic import ValidationError
+from bs4 import BeautifulSoup
 
 from .config import (
     SCRAPE_START_URL,
-    MAX_PAGES,
-    CONCURRENCY,
-    REQUEST_TIMEOUT,
-    BATCH_SIZE,
-    RETRIES,
-    JITTER_MIN,
-    JITTER_MAX,
-    RETRY_BACKOFF,
-    ENABLE_PHONE_FETCH,
-    PHONE_POPUP_URL,
+    MAX_CONCURRENT_RETRIES,
+    MAX_PAGES_TO_SCRAPE
 )
+from typing import List, Optional
 from .models import CarListing
-from .parser import parse_listing
 
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-LISTING_URL_RE = re.compile(r"https?://auto\.ria\.com/uk/auto_[^\"'#?]+?\.html")
-LISTING_URL_REL_RE = re.compile(r"/uk/auto_[^\"'#?]+?\.html")
-USER_AGENTS = [
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_0) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/121.0.0.0 Safari/537.36",
-]
-logger = logging.getLogger(__name__)
+AD_PER_PAGE = 20
 
 
 class Scraper:
-    """Async AutoRia scraper with page->queue->workers->batch insert pipeline."""
+    """Main Scraper class to handle fetching and parsing of auto listings from auto.ria.com."""
+    def __init__(self):
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        self.timeout = aiohttp.ClientTimeout(total=20)
+        self.sem = asyncio.Semaphore(MAX_CONCURRENT_RETRIES)
 
-    def __init__(
-        self,
-        start_url: str = SCRAPE_START_URL,
-        concurrency: int = CONCURRENCY,
-        timeout: int = REQUEST_TIMEOUT,
-        max_pages: int = MAX_PAGES,
-        batch_size: int = BATCH_SIZE,
-    ) -> None:
-        """Initialize scraper settings and limits."""
-        self.start_url = start_url
-        self.concurrency = max(concurrency, 1)
-        self.timeout = max(timeout, 5)
-        self.max_pages = max_pages
-        self.batch_size = max(batch_size, 1)
-
+    # === HELPERS ===
     @staticmethod
-    def _build_page_url(base_url: str, page: int) -> str:
-        """Return a paginated URL for search results."""
-        if page <= 1:
-            return base_url
-        parts = urlsplit(base_url)
-        query = parse_qs(parts.query)
-        query["page"] = [str(page)]
-        return urlunsplit(
-            (
-                parts.scheme or "https",
-                parts.netloc or "auto.ria.com",
-                parts.path,
-                urlencode(query, doseq=True),
-                parts.fragment,
-            )
-        )
+    def _get_pinia(html: str) -> dict:
+        """ Extract Data from Pinia state from HTML. We look for the JavaScript variable window.__PINIA__ and try to parse the JSON object that follows it."""
+        start_marker = "window.__PINIA__ ="
+        start_index = html.find(start_marker)
+        if start_index == -1:
+            return {}
 
-    async def _fetch_text(self, session: aiohttp.ClientSession, url: str) -> str:
-        """Fetch page HTML with retries, jitter, and basic backoff."""
-        retries = max(RETRIES, 1)
-        for attempt in range(retries):
-            await asyncio.sleep(random.uniform(JITTER_MIN, JITTER_MAX))
+        # Find the start of the JSON object after the marker
+        json_start = html.find("{", start_index)
+        if json_start == -1:
+            return {}
+
+        # Find the matching closing bracket for the JSON object. We need to account for nested brackets, so we will count them.
+        bracket_count = 0
+        json_str = ""
+        for i in range(json_start, len(html)):
+            char = html[i]
+            if char == "{":
+                bracket_count += 1
+            elif char == "}":
+                bracket_count -= 1
+
+            json_str += char
+
+            if bracket_count == 0:
+                break
+
+        if not json_str:
+            return {}
+
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            # If JSON parsing fails, we can try to clean the string from common issues like trailing commas or unescaped characters.
             try:
-                async with session.get(url, headers=self._random_headers()) as resp:
-                    if resp.status == 200:
-                        return await resp.text(errors="ignore")
-                    if resp.status in {429, 500, 502, 503, 504}:
-                        logger.warning("retryable status %s for %s", resp.status, url)
-                        await asyncio.sleep(RETRY_BACKOFF * (attempt + 1))
-                        continue
-                    logger.warning("non-200 status %s for %s", resp.status, url)
-                    return ""
-            except asyncio.TimeoutError:
-                logger.warning("timeout on %s", url)
-                await asyncio.sleep(RETRY_BACKOFF * (attempt + 1))
-            except aiohttp.ClientError:
-                logger.warning("client error on %s", url)
-                await asyncio.sleep(RETRY_BACKOFF * (attempt + 1))
-        logger.warning("exhausted retries for %s", url)
-        return ""
+                # Minimal cleaning: remove trailing commas before closing brackets
+                clean_json = re.sub(r",\s*([\]}])", r"\1", json_str)
+                return json.loads(clean_json)
+            except:
+                logging.error(f"Pinia Hard Decode Error: {str(e)[:100]}")
+        return {}
 
-    @staticmethod
-    def _extract_listing_urls(html: str) -> list[str]:
-        """Extract listing URLs from a search results page."""
-        urls = set(LISTING_URL_RE.findall(html))
-        urls.update(
-            f"https://auto.ria.com{rel}" for rel in LISTING_URL_REL_RE.findall(html)
-        )
-        return list(urls)
+    # === TOTAL PAGES ===
+    async def get_total_pages(self, session: aiohttp.ClientSession) -> int:
+        """
+        Get total number of pages by parsing the initial search page HTML for results count.
+        We look for the JavaScript variable that holds the total results count and calculate pages from it.
+        """
+        logging.info("Getting count pages from window.ria.server.resultsCount...")
 
-    @staticmethod
-    def _random_headers() -> dict[str, str]:
-        """Return randomized headers to reduce request fingerprinting."""
-        return {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
-        }
+        # Load the first page HTML to find the total results count.
+        # We use the stable _fetch method with retries.
+        html = await self._fetch(session, SCRAPE_START_URL + "?page=1")
 
-    async def iter_listing_urls(
-        self, session: aiohttp.ClientSession
-    ) -> AsyncIterator[list[str]]:
-        """Yield batches of listing URLs page by page."""
-        collected: set[str] = set()
-        page = 1
-        while True:
-            if self.max_pages and page > self.max_pages:
-                break
-            page_url = self._build_page_url(self.start_url, page)
-            html = await self._fetch_text(session, page_url)
-            page_urls = self._extract_listing_urls(html)
-            if not page_urls:
-                break
-            new = [u for u in page_urls if u not in collected]
-            collected.update(new)
-            if page > 1 and not new:
-                break
-            logger.info("page %s: found %s urls", page, len(new))
-            yield new
-            page += 1
-
-    @staticmethod
-    def _build_phone_payload(meta: dict[str, Any]) -> dict[str, Any]:
-        """Build phone popup payload from extracted metadata."""
-        return {
-            "blockId": "autoPhone",
-            "popUpId": "autoPhone",
-            "isLoginRequired": False,
-            "isConfirmPhoneEmailRequired": False,
-            "autoId": int(meta["auto_id"]),
-            "data": [
-                ["userId", meta["user_id"]],
-                ["phoneId", meta["phone_id"]],
-                ["title", meta.get("title", "")],
-                ["isCheckedVin", ""],
-                ["companyId", ""],
-                ["companyEng", ""],
-                ["avatar", meta.get("avatar", "")],
-                ["userName", meta.get("user_name", "")],
-                ["isCardPayer", "1"],
-                ["dia", ""],
-                ["isOnline", ""],
-                ["isCompany", ""],
-                ["workTime", ""],
-                ["srcAnalytic", "main_side_sellerInfo_sellerInfoPhone_showBottomPopUp"],
-            ],
-            "params": {
-                "userId": meta["user_id"],
-                "phoneId": meta["phone_id"],
-                "title": meta.get("title", ""),
-                "isCheckedVin": "",
-                "companyId": "",
-                "companyEng": "",
-                "avatar": meta.get("avatar", ""),
-                "userName": meta.get("user_name", ""),
-                "isCardPayer": "1",
-                "dia": "",
-                "isOnline": "",
-                "isCompany": "",
-                "workTime": "",
-            },
-            "target": {},
-            "formId": None,
-            "langId": 4,
-            "device": "desktop-web",
-        }
-
-    async def _fetch_phone_number(
-        self, session: aiohttp.ClientSession, url: str, meta: dict[str, Any]
-    ) -> str | None:
-        """Call phone popup endpoint and return normalized digits."""
-        payload = self._build_phone_payload(meta)
-        try:
-            async with session.post(
-                PHONE_POPUP_URL, json=payload, headers=self._random_headers()
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning("phone status %s for %s", resp.status, url)
-                    return None
-                text = await resp.text(errors="ignore")
-        except asyncio.TimeoutError:
-            logger.warning("phone timeout for %s", url)
-            return None
-        except aiohttp.ClientError:
-            logger.warning("phone client error for %s", url)
-            return None
-        if not text:
-            return None
-        phone_value: Any = None
-        try:
-            payload = json.loads(text)
-            if isinstance(payload, dict):
-                phone_value = _as_dict(payload.get("additionalParams")).get("phoneStr")
-        except json.JSONDecodeError:
-            phone_value = text
-        digits = re.sub(r"\D", "", str(phone_value)) if phone_value else ""
-        return digits or None
-
-    async def scrape_single(
-        self, session: aiohttp.ClientSession, url: str
-    ) -> CarListing | None:
-        """Scrape one listing URL and return a validated CarListing."""
-        html = await self._fetch_text(session, url)
         if not html:
-            logger.warning("empty response: %s", url)
-            return None
-        data, phone_meta, missing = parse_listing(html, url)
-        if phone_meta and ENABLE_PHONE_FETCH:
-            phone_number = await self._fetch_phone_number(session, url, phone_meta)
-            if phone_number:
-                data["phone_number"] = phone_number
+            logging.error(
+                "Can't load the first page to get total results count, defaulting to 1 page."
+            )
+            return 1
+
         try:
-            if missing:
-                optional = {"car_number"}
-                critical = [field for field in missing if field not in optional]
-                if critical:
-                    logger.warning(
-                        "missing fields for %s after pinia/ld_json/title/meta: %s",
-                        url,
-                        ", ".join(missing),
-                    )
-                else:
-                    logger.info(
-                        "missing optional fields for %s after pinia/ld_json/title/meta: %s",
-                        url,
-                        ", ".join(missing),
-                    )
-            return CarListing(**data)
-        except (ValidationError, ValueError, TypeError):
-            logger.exception("failed to parse listing: %s", url)
+            # Searching number in string window.ria.server.resultsCount = Number(312990);
+            match = re.search(
+                r"window\.ria\.server\.resultsCount\s*=\s*Number\((\d+)\)", html
+            )
+
+            if match:
+                ads_count = int(match.group(1))
+                total_pages = math.ceil(ads_count / AD_PER_PAGE)
+                logging.info(f"Found listings: {ads_count}. Pages: {total_pages}")
+                return total_pages
+
+        except Exception as ex:
+            logging.error(f"Error in process resultsCount: {ex}")
+
+        logging.warning("Don't find count pages, parsing only 1 page.")
+        return 1
+
+    # === STABLE FETCH (aiohttp): retry + backoff ===
+
+    async def _fetch(self, session: aiohttp.ClientSession, url: str) -> str | None:
+        """Fetch a URL with retries and exponential backoff."""
+        backoff = 1.0
+
+        for attempt in range(1, MAX_CONCURRENT_RETRIES + 1):
+            try:
+                async with self.sem:
+                    async with session.get(
+                        url, headers=self.headers, allow_redirects=True
+                    ) as resp:
+                        status = resp.status
+                        raw = await resp.read()
+                if status in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 20)
+                    continue
+                if status != 200:
+                    logging.info(f"Failed to fetch {url}: HTTP {status}")
+                    return None
+                return raw.decode("utf-8", errors="replace")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 20)
+                logging.error(f"Error fetching {url} (attempt {attempt}): {ex}")
+
+        return None
+
+    # === SEARCH PAGE: fetch + parse urls ===
+
+    async def fetch_search_page(
+        self, session: aiohttp.ClientSession, page_num: int
+    ) -> str:
+        """Fetch a search results page HTML."""
+        url = f"{SCRAPE_START_URL}?page={page_num}"
+        return await self._fetch(session, url)
+
+    @staticmethod
+    async def parse_search_page(html: str) -> List[str]:
+        """
+        Extract listing URLs from a search results page.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        links = soup.find_all("a", class_="m-link-ticket", href=True)
+        return list(
+            {
+                l["href"]
+                for l in links
+                if l["href"].startswith("https://auto.ria.com/uk/auto")
+            }
+        )
+
+    # === LISTING PAGE: fetch + parse to CarListing ===
+    async def fetch_listing_html(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> Optional[str]:
+        return await self._fetch(session, url)
+
+    def _find_key_recursive(self, data: dict, target_key: str):
+        """ Finds key in nested dicts. Returns value if found, else None. """
+        if target_key in data:
+            return data[target_key]
+        for key, value in data.items():
+            if isinstance(value, dict):
+                result = self._find_key_recursive(value, target_key)
+                if result:
+                    return result
+        return None
+
+    @staticmethod
+    def _get_title(soup: BeautifulSoup) -> str:
+        """Extract title from the listing page."""
+        return soup.find("h1").get_text(strip=True) if soup.find("h1") else "Auto"
+
+    @staticmethod
+    def _get_price_usd(html: str, soup: BeautifulSoup) -> int | None:
+        # 1. Price in usd
+        price_usd = 0
+        # Find price in USD. It can be in different formats, so we will try several regex patterns to find it.
+        # We will look for "usd":12345 or "priceUSD":12345 or "price":12345 in the raw HTML, and if that fails, we will try to find it in the text using BeautifulSoup.
+        price_match = (
+                re.search(r'"usd"\s*:\s*(\d+)', html)
+                or re.search(r'"priceUSD"\s*:\s*(\d+)', html)
+                or re.search(r'"price"\s*:\s*(\d+)', html)
+        )
+        if price_match:
+            val = int(price_match.group(1))
+            # If price is small (like 11), it's likely not price.
+            # If it's large (150000), it's already in full amount.
+            if val > 100:
+                price_usd = val
+            else:
+                # Try to find price in the text, like "11 тис. $"
+                price_tag = soup.select_one(".price_value strong")
+                if price_tag:
+                    price_usd = int(re.sub(r"\D", "", price_tag.get_text()))
+        return price_usd if price_usd > 0 else None
+
+    @staticmethod
+    def _get_odometer(html: str) -> int | None:
+        """Extract odometer (mileage) from HTML using regex."""
+        odometer = 0
+        # Find raceInt of odometer. It can be in different formats, so we will try several regex patterns to find it.
+        # We will look for "raceInt":12345 or "odometer":12345 in the raw HTML, and if that fails, we will try to find it in the text using BeautifulSoup.
+        odo_match = re.search(r'"raceInt"\s*:\s*(\d+)', html) or re.search(
+            r'"odometer"\s*:\s*(\d+)', html
+        )
+        if odo_match:
+            val = int(odo_match.group(1))
+            # If number is small (like 150), it's likely in thousands, so we will multiply it by 1000.
+            # If it's large (150000), it's already in full amount.
+            odometer = val * 1000 if val < 2000 else val
+        else:
+            # Reserve search in text, like "150 тис. км"
+            text_odo = re.search(r"(\d+)\s*тис\.\s*км", html)
+            if text_odo:
+                odometer = int(text_odo.group(1)) * 1000
+        return odometer if odometer > 0 else None
+
+    @staticmethod
+    def _get_username(html:str) -> str:
+        """Extract seller's name from HTML."""
+        username_match = re.search(r'"userName"\s*:\s*"([^"]+)"', html)
+        return username_match.group(1) if username_match else "Продавець"
+
+
+    async def _get_phone_number(
+            self, session: aiohttp.ClientSession, html: str, url: str
+        ) -> int | None:
+            # Get userId, phoneId, autoId from HTML. It can be in PINIA or in the raw HTML as JavaScript variables. We will try both.
+            user_id_match = re.search(r'"userId"\s*:\s*(\d+)', html)
+            phone_id_match = re.search(r'"phoneId"\s*:\s*"(\d+)"', html)
+            auto_id_match = re.search(r"_(\d+)\.html", url)
+
+            user_id = user_id_match.group(1) if user_id_match else None
+            phone_id = phone_id_match.group(1) if phone_id_match else None
+            auto_id = auto_id_match.group(1) if auto_id_match else None
+
+            if not all([user_id, phone_id, auto_id]):
+                logging.warning(f"Still no IDs for {url}: user={user_id}, phone={phone_id}")
+                return None
+
+            # Proceed to API call to get phone number using the extracted IDs.
+            payload = {
+                "blockId": "autoPhone",
+                "popUpId": "autoPhone",
+                "autoId": int(auto_id),
+                "data": [
+                    ["userId", str(user_id)],
+                    ["phoneId", str(phone_id)],
+                    ["userName", "Продавець"],
+                    ["srcAnalytic", "main_side_sellerInfo_sellerInfoPhone_showBottomPopUp"],
+                ],
+                "params": {"userId": str(user_id), "phoneId": str(phone_id)},
+                "langId": 4,
+                "device": "desktop-web",
+            }
+
+            api_url = "https://auto.ria.com/bff/final-page/public/auto/popUp/"
+            headers = {
+                **self.headers,
+                "X-Ria-Source": "vue3-1.47.0",
+                "Content-Type": "application/json",
+            }
+
+            try:
+                async with session.post(api_url, json=payload, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        res = data.get("additionalParams", {}).get("phoneStr", "")
+                        raw_phone = re.sub(r"\D", "", res)
+                        if raw_phone.startswith("0") and len(raw_phone) == 10:
+                            return int("38" + raw_phone)
+            except Exception as ex:
+                logging.error(f"API Phone Error: {ex}")
             return None
+
+    @staticmethod
+    def _get_images(html: str) -> tuple:
+        """Extract first image URL and total image count from HTML."""
+        image_links = re.findall(
+            r'"large":"(https://cdn\d+\.riastatic\.com/photosnew/auto/photo/.*?hd\.webp)"',
+            html,
+        )
+        return (image_links[0], len(image_links)) if image_links else (None, 0)
+
+    @staticmethod
+    def _get_car_number(html: str, soup: BeautifulSoup) -> str | None:
+        """
+        Extract car number (stateNumber) from HTML.
+        We will try several methods to find it, starting with the most reliable one (meta description), and then falling back to BeautifulSoup if needed.
+        """
+        # First try to find in meta description, where it is often in format "(ВН1234ЕК)". We
+        pattern = r"\(([А-ЯA-Z]{2}\d{4}[А-ЯA-Z]{2})\)"
+        number_match = re.search(pattern, html)
+
+        if number_match:
+            return number_match.group(1).strip()
+
+        # Second try: find the span with class "state-num" and extract text.
+        # It may contain the number along with region and city, so we will clean it to get only the number part.
+        num_tag = soup.find("span", class_="state-num")
+        if num_tag:
+            raw_text = num_tag.get_text(strip=True)
+            clean_number = raw_text.split(" ")[0].replace(" ", "")
+            return clean_number
+
+        return None
+
+    @staticmethod
+    def _get_car_vin(html: str) -> str | None:
+        """Extract VIN from HTML using regex."""
+        vin_match = re.search(r'"vin"\s*:\s*"([A-Z0-9]{17})"', html)
+        return vin_match.group(1) if vin_match else None
+
+    async def parse_listing_page(
+        self, session: aiohttp.ClientSession, html: str, url: str
+    ) -> CarListing:
+        soup = BeautifulSoup(html, "html.parser")
+
+        title = self._get_title(soup)
+        price_usd = self._get_price_usd(html, soup)
+        odometer = self._get_odometer(html)
+        username = self._get_username(html)
+        phone_number = await self._get_phone_number(session, html, url)
+        image_url, images_count = self._get_images(html)
+        car_number = self._get_car_number(html, soup)
+        car_vin = self._get_car_vin(html)
+
+        return CarListing(
+            url=url,
+            title=title,
+            price_usd=price_usd,
+            odometer=odometer,
+            username=username,
+            phone_number=phone_number,
+            image_url=image_url,
+            images_count=images_count,
+            car_number=car_number,
+            car_vin=car_vin,
+        )
 
     async def run(self, db) -> None:
-        """Run scraping pipeline and write results in batches."""
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            url_queue: asyncio.Queue[str | None] = asyncio.Queue(
-                maxsize=self.concurrency * 2
-            )
-            result_queue: asyncio.Queue[CarListing | None] = asyncio.Queue(
-                maxsize=self.batch_size * 2
-            )
+        """Streamlined main method to run the scraper with database integration."""
+        logging.info("Starting Scraper jobs...")
 
-            # Producer -> URL queue, workers -> result queue, collector -> DB batches.
-            async def producer() -> None:
-                async for urls in self.iter_listing_urls(session):
-                    for url in urls:
-                        await url_queue.put(url)
-                for _ in range(self.concurrency):
-                    await url_queue.put(None)
+        async with aiohttp.ClientSession() as session:
+            # Get total pages to scan
+            total_pages = await self.get_total_pages(session)
 
-            async def worker() -> None:
-                while True:
-                    url = await url_queue.get()
-                    if url is None:
-                        break
-                    listing = await self.scrape_single(session, url)
-                    if listing is not None:
-                        await result_queue.put(listing)
-                await result_queue.put(None)
+            if MAX_PAGES_TO_SCRAPE > 0:
+                pages_to_scan = min(total_pages, MAX_PAGES_TO_SCRAPE)
+            else:
+                pages_to_scan = total_pages
 
-            async def collector() -> None:
-                batch: list[CarListing] = []
-                done_workers = 0
-                while True:
-                    item = await result_queue.get()
-                    if item is None:
-                        done_workers += 1
-                        if done_workers >= self.concurrency:
-                            break
-                        continue
-                    batch.append(item)
-                    if len(batch) >= self.batch_size:
-                        db.insert_batch(batch)
-                        batch = []
-                if batch:
-                    db.insert_batch(batch)
+            logging.info(f"Scanning {pages_to_scan} pages out of {total_pages} total available.")
 
-            await asyncio.gather(
-                producer(), *(worker() for _ in range(self.concurrency)), collector()
-            )
+            for page_num in range(1, pages_to_scan + 1):
+                logging.info(f"=== Page parsing {page_num}/{pages_to_scan} ===")
+                # Get html of the search page
+                html = await self.fetch_search_page(session, page_num)
+                if not html:
+                    continue
+
+                # Get all listing URLs from the search page
+                all_urls = await self.parse_search_page(html)
+
+                # Url filtering: check which URLs are new and haven't been parsed before.
+                new_urls = [url for url in all_urls if not db.is_sampled(url)]
+
+                logging.info(
+                    f"Found links: {len(all_urls)}, new for parsing: {len(new_urls)}"
+                )
+
+                if not new_urls:
+                    continue
+
+                # Paralel parsing of new URLs with gather. Each URL will be processed in _process_single_listing.
+                tasks = [
+                    self._process_single_listing(session, url, db) for url in new_urls
+                ]
+                await asyncio.gather(*tasks)
+
+                # For stability
+                await asyncio.sleep(1.5)
+
+    async def _process_single_listing(
+        self, session: aiohttp.ClientSession, url: str, db
+    ) -> None:
+        """Helper method to process a single listing URL: fetch, parse, and save to DB."""
+        try:
+            html = await self.fetch_listing_html(session, url)
+            if not html:
+                return
+
+            car_data = await self.parse_listing_page(session, html, url)
+
+            # Saved to DB after parsing each listing to avoid data loss in case of crashes.
+            # The is_sampled check before ensures we don't save duplicates.
+            db.save_listing(car_data)
+            logging.info(f"Saved: {car_data.title} | {car_data.phone_number}")
+
+        except Exception as ex:
+            logging.error(f"Error in process {url}: {ex}")
+
