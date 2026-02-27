@@ -340,7 +340,7 @@ class Scraper:
                 logging.info("Skip %s: no image_url (deleted/invalid listing)", url)
                 return
             if not car_data.phone_number:
-                logging.info("Skip %s: no phone number (API error or missing IDs)", url)
+                logging.info("Skip %s : no phone number (API error or missing IDs)", url)
                 return
 
             # Saved to DB after parsing each listing to avoid data loss in case of crashes.
