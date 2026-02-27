@@ -312,21 +312,13 @@ class Scraper:
 
                 # Get all listing URLs from the search page
                 all_urls = await self.parse_search_page(html)
-
-                # Url filtering: check which URLs are new and haven't been parsed before.
-                new_urls = [url for url in all_urls if not db.is_sampled(url)]
-
-                logging.info(
-                    f"Found links: {len(all_urls)}, new for parsing: {len(new_urls)}"
-                )
-
-                if not new_urls:
+                existing = db.existing_urls(all_urls)
+                new_urls = [url for url in all_urls if url not in existing]
+                logging.info(f"Found {len(all_urls)} links, {len(existing)} already in DB, {len(new_urls)} new to process.")
+                if not all_urls:
                     continue
 
-                # Paralel parsing of new URLs with gather. Each URL will be processed in _process_single_listing.
-                tasks = [
-                    self._process_single_listing(session, url, db) for url in new_urls
-                ]
+                tasks = [self._process_single_listing(session, url, db) for url in new_urls]
                 await asyncio.gather(*tasks)
 
                 # For stability

@@ -55,16 +55,14 @@ class DB:
             cur.execute(CREATE_TABLE)
             conn.commit()
 
-    def is_sampled(self, url: str) -> bool:
-        """Check if a listing with the given URL already exists in the database."""
-        query = "SELECT 1 FROM car_listings WHERE url = %s LIMIT 1"
-        try:
-            with self._connect() as conn, conn.cursor() as cur:
-                cur.execute(query, (url,))
-                return cur.fetchone() is not None
-        except Exception as ex:
-            logging.error(f"Database check error: {ex}")
-            return False
+    def existing_urls(self, urls: list[str]) -> set[str]:
+        """ Check which of the given URLs already exist in the database. """
+        if not urls:
+            return set()
+        q = "SELECT url FROM car_listings WHERE url = ANY(%s)"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(q, (urls,))
+            return {row[0] for row in cur.fetchall()}
 
     def insert_batch(self, listings: Iterable[CarListing]) -> None:
         """ Insert a batch of listings into the database. """
