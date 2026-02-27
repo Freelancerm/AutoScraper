@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -18,6 +19,25 @@ class ScheduleConfig:
     dump_time: str  # "HH:MM"
     run_on_startup: bool
 
+
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_config_from_env() -> ScheduleConfig:
+    tz = os.getenv("TZ", "Europe/Kyiv")
+    scrape_time = os.getenv("SCRAPE_TIME", "12:00")
+    dump_time = os.getenv("DUMP_TIME", "12:00")
+    run_on_startup = parse_bool(os.getenv("RUN_ON_STARTUP"), default=False)
+
+    return ScheduleConfig(
+        tz=tz,
+        scrape_time=scrape_time,
+        dump_time=dump_time,
+        run_on_startup=run_on_startup,
+    )
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
     # strict "HH:MM"

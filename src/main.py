@@ -1,18 +1,12 @@
-import os
 import asyncio
 import logging
 
 from .database import DB
 from .scraper import Scraper
 
-from .scheduler import AppScheduler, ScheduleConfig
+from .scheduler import AppScheduler, load_config_from_env
 
-cfg = ScheduleConfig(
-    tz=os.getenv("TZ"),
-    scrape_time=os.getenv("SCRAPE_TIME"),
-    dump_time=os.getenv("DUMP_TIME"),
-    run_on_startup=bool(os.getenv("RUN_ON_STARTUP"))
-)
+cfg = load_config_from_env()
 
 
 async def main() -> None:
