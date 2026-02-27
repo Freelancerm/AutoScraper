@@ -8,7 +8,7 @@ class CarListing(BaseModel):
     price_usd: int | None
     odometer: int | None
     username: str
-    phone_number: int
+    phone_number: int | None
     image_url: str | None
     images_count: int
     car_number: str | None
