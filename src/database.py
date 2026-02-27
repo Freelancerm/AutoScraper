@@ -1,5 +1,5 @@
 import os
-import subprocess
+import asyncio
 import logging
 from datetime import datetime, UTC
 from pathlib import Path
@@ -9,7 +9,6 @@ import psycopg
 
 from .config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
 from .models import CarListing
-
 
 CREATE_TABLE = """
         CREATE TABLE IF NOT EXISTS car_listings (
@@ -80,25 +79,33 @@ class DB:
             cur.executemany(LISTING_INSERT, params)
             conn.commit()
 
-    def create_dump(self) -> None:
+    async def create_dump(self) -> None:
+        """Create a backup dump of the database using pg_dump."""
         filename = f"dump_{datetime.now(UTC):%Y%m%d_%H%M%S}.dump"
         output_path = self.DUMPS_DIR / filename
-        logging.info(f"📦 Creating backup to DB: {filename}")
+        logging.info(f"Creating backup to DB: {filename}")
         cmd = [
             "pg_dump",
             "--format=custom",
-            "--file",
-            str(output_path),
-            "--host",
-            DB_HOST,
-            "--port",
-            str(DB_PORT),
-            "--username",
-            DB_USER,
+            "--file", str(output_path),
+            "--host", DB_HOST,
+            "--port", str(DB_PORT),
+            "--username", DB_USER,
             DB_NAME,
         ]
         env = os.environ.copy()
         if DB_PASSWORD:
             env["PGPASSWORD"] = DB_PASSWORD
-        subprocess.run(cmd, check=True, env=env)
 
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Backup failed with code {proc.returncode}: {stderr.decode(errors='replace')}")
+        logging.info(f"Dump created: {output_path}")

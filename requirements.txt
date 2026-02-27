@@ -12,3 +12,4 @@ pytokens==0.4.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 bs4==0.0.2
+APScheduler==3.11.2

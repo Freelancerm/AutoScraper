@@ -1,2 +1,0 @@
-0 0 * * * cd /app && python -m src.main >> /var/log/scraper.log 2>&1
-0 23 * * * cd /app && python -c "from src.database import DB; DB().create_dump()" >> /var/log/db_backup.log 2>&1
