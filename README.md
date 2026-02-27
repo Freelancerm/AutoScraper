@@ -66,7 +66,7 @@ cp example.env .env
 ```
 2) Start services:
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
 
 Scraper logs are in the `app` container stdout. Dumps are written to `dumps/`.
