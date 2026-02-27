@@ -3,7 +3,8 @@ import asyncio
 import logging
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping, Any
+from dataclasses import is_dataclass, asdict
 
 import psycopg
 
@@ -66,15 +67,21 @@ class DB:
             return False
 
     def insert_batch(self, listings: Iterable[CarListing]) -> None:
-        """ Insert a batch of listings into the database. Accepts both CarListing instances and dicts."""
-        params = []
-        for listing in listings:
-            if hasattr(listing, "model_dump"):
-                params.append(listing.model_dump())
-            else:
-                params.append(dict(listing))
+        """ Insert a batch of listings into the database. """
+
+        def serialize(listing: CarListing) -> None | dict[str, Any]:
+            """Helper to convert various types to dict."""
+            if listing is None: return None
+            if isinstance(listing, Mapping): return dict(listing)
+            if hasattr(listing, "model_dump"): return listing.model_dump()
+            if is_dataclass(listing): return asdict(listing)
+            raise TypeError(f"Unsupported listing type: {type(listing)!r}")
+
+        params = [p for p in map(serialize, listings) if p is not None]
+
         if not params:
             return
+
         with self._connect() as conn, conn.cursor() as cur:
             cur.executemany(LISTING_INSERT, params)
             conn.commit()

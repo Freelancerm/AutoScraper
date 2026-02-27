@@ -344,8 +344,9 @@ class Scraper:
             car_data = await self.parse_listing_page(session, html, url)
 
             # Saved to DB after parsing each listing to avoid data loss in case of crashes.
-            db.insert_batch(car_data)
+            db.insert_batch([car_data])
             logging.info(f"Saved: {car_data.title} | {car_data.phone_number}")
 
+
         except Exception as ex:
-            logging.error(f"Error in process {url}: {ex}")
+            logging.exception(f"Error in process %s, {ex}", url)
