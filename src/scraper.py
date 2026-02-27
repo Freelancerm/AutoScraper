@@ -89,6 +89,7 @@ class Scraper:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 20)
                 logging.error(f"Error fetching {url} (attempt {attempt}): {ex}")
+                continue
 
         return None
 
@@ -338,15 +339,12 @@ class Scraper:
             car_data = await self.parse_listing_page(session, html, url)
             if not car_data.image_url:
                 logging.info("Skip %s: no image_url (deleted/invalid listing)", url)
-                return
             if not car_data.phone_number:
                 logging.info("Skip %s : no phone number (API error or missing IDs)", url)
-                return
 
             # Saved to DB after parsing each listing to avoid data loss in case of crashes.
             db.insert_batch([car_data])
-            logging.info(f"Saved: {car_data.title} | {car_data.phone_number}")
-
+            logging.info("Saved: %s | %s", car_data.title, car_data.phone_number)
 
         except Exception as ex:
             logging.exception(f"Error in process %s, {ex}", url)
