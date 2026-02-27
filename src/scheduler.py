@@ -49,25 +49,31 @@ class AppScheduler:
         # Locks to avoid overlapping runs
         self._lock = asyncio.Lock()
 
-    async def _guarded(self, name: str, coro) -> None:
-        """ Run the given coroutine with a lock to prevent overlapping executions. Logs start, finish, and exceptions. """
-        if self._lock.locked():
+    async def _guarded(self, name: str, coro, *, wait: bool) -> None:
+        """
+        Run coroutine under a lock.
+        - wait=False: if locked -> skip (good for SCRAPE)
+        - wait=True:  if locked -> wait until free (good for DUMP)
+        """
+        if self._lock.locked() and not wait:
             log.warning("%s skipped: job already running", name)
             return
+
+        # If wait=True, we intentionally queue behind the current job.
         async with self._lock:
             log.info("%s started", name)
             try:
                 await coro()
             except Exception as ex:
-                log.exception(f"%s failed: {ex}", name)
+                log.exception("%s failed: %s", name, ex)
             finally:
                 log.info("%s finished", name)
 
     async def _scrape_job(self) -> None:
-        await self._guarded("SCRAPE", self.run_scrape)
+        await self._guarded("SCRAPE", self.run_scrape, wait=False)
 
     async def _dump_job(self) -> None:
-        await self._guarded("DUMP", self.run_dump)
+        await self._guarded("DUMP", self.run_dump, wait=True)
 
     def start(self) -> None:
         """ Parse the configured times, set up the scheduled jobs, and start the scheduler. Jobs are set to coalesce and have a misfire grace time of 30"""
